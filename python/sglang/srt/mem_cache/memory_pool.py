@@ -2093,6 +2093,7 @@ class HybridLinearKVPool(KVCache):
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
+            mla_extra_kwargs = {}
 
             if current_platform.is_out_of_tree():
                 TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
@@ -2102,6 +2103,10 @@ class HybridLinearKVPool(KVCache):
                 )
 
                 TokenToKVPoolClass = NPUMLATokenToKVPool
+                # NPUMLATokenToKVPool requires index_head_dim (used only by DSA
+                # indexer models). Hybrid linear MLA models such as
+                # BailingMoeV2_5 are non-DSA, so pass None.
+                mla_extra_kwargs["index_head_dim"] = None
 
             self.full_kv_pool = TokenToKVPoolClass(
                 size=size,
@@ -2112,6 +2117,7 @@ class HybridLinearKVPool(KVCache):
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 enable_memory_saver=enable_memory_saver,
+                **mla_extra_kwargs,
             )
         self.full_attention_layer_id_mapping = {
             id: i for i, id in enumerate(full_attention_layer_ids)

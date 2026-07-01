@@ -256,12 +256,17 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         )
         last_steps = last_correct_step_indices.to(torch.int64)  # [N]
 
+        # h_block_size=1 keeps the per-program tile (H_BLOCK_SIZE * BLOCK_V *
+        # BLOCK_K fp32, double-buffered) within the Ascend unified buffer. The
+        # default of 2 overflows UB on this model's mamba state shape
+        # (V=K=head_dim=128), failing BiShengIR compilation with "ub overflow".
         move_intermediate_cache(
             ssm_states,
             intermediate_state_cache,
             dst_indices_tensor,
             src_indices_tensor,
             last_steps,
+            h_block_size=1,
         )
 
         draft_token_num = intermediate_state_cache.shape[2]
@@ -276,6 +281,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 mamba_track_indices,
                 src_indices_tensor,
                 mamba_steps_to_track,
+                h_block_size=1,
             )
 
             track_mask = mamba_steps_to_track >= 0
@@ -287,7 +293,11 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                     :, dst_indices_tensor[track_mask]
                 ]
 
-        if dst_indices_tensor.numel() > 0:
+        # BailingMoeV2_5 segmented linear attention is decay-only (conv_kernel=1,
+        # intermediate_size=0), so the conv state collapses to a zero-width tensor
+        # and there is nothing to roll back. Skipping avoids the rollback kernel's
+        # tl.arange(0, num_dims) with num_dims == 0, which fails to compile.
+        if dst_indices_tensor.numel() > 0 and conv_states.shape[-1] > 0:
             conv_state_rollback(
                 conv_states,
                 dst_indices_tensor,
@@ -295,7 +305,11 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
                 draft_token_num,
             )
 
-        if mamba_track_indices is not None and mamba_track_indices.numel() > 0:
+        if (
+            mamba_track_indices is not None
+            and mamba_track_indices.numel() > 0
+            and conv_states.shape[-1] > 0
+        ):
             conv_state_rollback(
                 conv_states,
                 mamba_track_indices,

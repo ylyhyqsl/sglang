@@ -314,7 +314,14 @@ def rms_norm_gated(
     if bias is not None:
         bias = bias.contiguous()
     if _is_npu:
-        assert activation == "swish", "NPU only supports swish activation"
+        # The NPU fused kernel applies gating only when z is not None. Its gated
+        # path supports swish (z * sigmoid(z)) and sigmoid (sigmoid(z)); when z
+        # is None it performs plain (group) RMSNorm and the activation value is
+        # irrelevant.
+        assert z is None or activation in (
+            "swish",
+            "sigmoid",
+        ), "NPU fused gated RMSNorm supports only swish or sigmoid activation when gating (z) is provided"
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,

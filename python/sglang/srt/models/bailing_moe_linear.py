@@ -102,7 +102,18 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 else:
-    from vllm._custom_ops import awq_dequantize
+    try:
+        from vllm._custom_ops import awq_dequantize
+    except ImportError:
+        # vLLM is unavailable on Ascend NPU; awq_dequantize is only used for
+        # AWQ-quantized checkpoints. Defer the failure to call time so that
+        # non-AWQ (e.g. BF16) checkpoints can still import and run.
+        def awq_dequantize(*args, **kwargs):
+            raise ImportError(
+                "awq_dequantize requires vllm._custom_ops, which is not "
+                "available in this environment. AWQ-quantized weights are "
+                "unsupported here; use a non-AWQ checkpoint."
+            )
 
 if _is_hip:
     pass
@@ -114,7 +125,10 @@ _is_sm100_supported = is_cuda() and is_sm100_supported()
 class DsV3MLA(DeepseekV2AttentionMLA):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        if kwargs["rope_scaling"]:
+        # On CUDA the fused yarn rope path is selected via forward_cuda; on NPU
+        # that kernel (apply_rope_with_cos_sin_cache_inplace) is unavailable, so
+        # keep the platform-dispatched forward (forward_npu) instead.
+        if kwargs["rope_scaling"] and not _is_npu:
             self.rotary_emb.forward = self.rotary_emb.forward_cuda
 
 
@@ -398,6 +412,23 @@ class BailingGroupRMSNormGate(RMSNormGated):
         )
         self.weight.weight_loader = self.weight_loader
 
+    def forward(self, x, z=None):
+        # The NPU fused gated-RMSNorm triton kernel overflows the unified
+        # buffer for this model's group/feature sizes. When no gating tensor is
+        # provided (the Bailing path applies sigmoid gating separately), this
+        # reduces to a plain grouped RMSNorm, which we compute with native torch
+        # ops on NPU to avoid the kernel while preserving the reference math.
+        if _is_npu and z is None:
+            og_shape = x.shape
+            group_size = self.group_size or og_shape[-1]
+            xg = x.reshape(*og_shape[:-1], og_shape[-1] // group_size, group_size)
+            xg = xg.float()
+            var = xg.pow(2).mean(dim=-1, keepdim=True)
+            xg = xg * torch.rsqrt(var + self.eps)
+            out = xg.reshape(og_shape).to(x.dtype)
+            return out * self.weight
+        return super().forward(x, z)
+
     @staticmethod
     def weight_loader(
         param: torch.nn.Parameter,
@@ -615,6 +646,9 @@ class BailingMoELinearAttention(nn.Module):
         gate, _ = self.g_proj(hidden_states)
 
         if self.group_norm_size > 1:
+            # Fused gated grouped RMSNorm. The NPU kernel now natively supports
+            # sigmoid gating (norm(x) * sigmoid(gate)), matching this model's
+            # reference math, so both CUDA and NPU take the fused path.
             hidden = self.g_norm(hidden, gate)
         else:
             hidden = self.g_norm(hidden)
@@ -1242,9 +1276,13 @@ class BailingMoELinearForCausalLM(nn.Module):
                 self_attn.w_kc = bind_or_assign(
                     self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
                 )
-                self_attn.w_vc = bind_or_assign(
-                    self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
-                )
+                w_vc = w_vc.contiguous().transpose(1, 2)
+                if _is_npu:
+                    # npu_batch_matmul_transpose produces wrong results on a
+                    # non-contiguous weight; force a contiguous buffer (matches
+                    # the DeepSeek-V2 NPU weight loader).
+                    w_vc = w_vc.contiguous()
+                self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
                 if (
                     hasattr(self_attn.kv_b_proj, "weight_scale")
                     and self_attn.w_scale is None
